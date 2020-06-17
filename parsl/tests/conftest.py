@@ -15,6 +15,10 @@ import parsl
 from parsl.dataflow.dflow import DataFlowKernelLoader
 from parsl.tests.utils import get_rundir
 
+pytest_plugins = [
+    "parsl.tests.logfixtures"
+]
+
 logger = logging.getLogger('parsl')
 
 

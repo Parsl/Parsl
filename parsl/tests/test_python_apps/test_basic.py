@@ -4,6 +4,7 @@ import time
 import pytest
 
 from parsl.app.app import python_app
+from parsl.tests.logfixtures import permit_severe_log
 
 
 @python_app
@@ -89,9 +90,10 @@ def test_stdout():
 def test_custom_exception():
     from globus_sdk import GlobusError
 
-    with pytest.raises(GlobusError):
-        x = custom_exception()
-        x.result()
+    with permit_severe_log():
+        with pytest.raises(GlobusError):
+            x = custom_exception()
+            x.result()
 
 
 def demonstrate_custom_exception():
