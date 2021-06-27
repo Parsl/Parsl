@@ -1,13 +1,41 @@
+from __future__ import annotations
 import logging
 import time
 import math
 from typing import List
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from parsl.dataflow.dflow import DataFlowKernel
+    from parsl.dataflow.task_status_poller import PollItem
+
+from parsl.executors.base import ParslExecutor, HasConnectedWorkers
+
+from typing import Dict
+from typing import Callable
+from typing import Optional
+from typing import Sequence
+from typing_extensions import TypedDict
+
+# this is used for testing a class to decide how to
+# print a status line. That might be better done inside
+# the executor class (i..e put the class specific behaviour
+# inside the class, rather than testing class instance-ness
+# here)
+
+# smells: testing class instance; importing a specific instance
+# of a thing that should be generic
+
 
 from parsl.dataflow.executor_status import ExecutorStatus
 from parsl.executors import HighThroughputExecutor
 from parsl.providers.provider_base import JobState
 
 logger = logging.getLogger(__name__)
+
+
+class ExecutorIdleness(TypedDict):
+    idle_since: Optional[float]
 
 
 class Strategy(object):
@@ -106,38 +134,45 @@ class Strategy(object):
 
     """
 
-    def __init__(self, dfk):
+    def __init__(self, dfk: "DataFlowKernel") -> None:
         """Initialize strategy."""
         self.dfk = dfk
         self.config = dfk.config
-        self.executors = {}
+        self.executors = {}  # type: Dict[str, ExecutorIdleness]
+        # self.executors = {}  # type: Dict[str, Dict[str, Any]]
         self.max_idletime = self.dfk.config.max_idletime
 
         for e in self.dfk.config.executors:
-            self.executors[e.label] = {'idle_since': None, 'config': e.label}
+            self.executors[e.label] = {'idle_since': None}
 
         self.strategies = {None: self._strategy_noop,
                            'simple': self._strategy_simple,
-                           'htex_auto_scale': self._strategy_htex_auto_scale}
+                           'htex_auto_scale': self._strategy_htex_auto_scale
+                          }  # type: Dict[Optional[str], Callable]
 
-        self.strategize = self.strategies[self.config.strategy]
+        # mypy note: with mypy 0.761, the type of self.strategize is
+        # correctly revealed inside this module, but isn't carried over
+        #  when Strategy is used in other modules unless this specific
+        # type annotation is used.
+
+        self.strategize = self.strategies[self.config.strategy]   # type: Callable
         self.logger_flag = False
         self.prior_loghandlers = set(logging.getLogger().handlers)
 
         logger.debug("Scaling strategy: {0}".format(self.config.strategy))
 
-    def add_executors(self, executors):
+    def add_executors(self, executors: Sequence[ParslExecutor]) -> None:
         for executor in executors:
-            self.executors[executor.label] = {'idle_since': None, 'config': executor.label}
+            self.executors[executor.label] = {'idle_since': None}
 
-    def _strategy_noop(self, status: List[ExecutorStatus], tasks):
+    def _strategy_noop(self, status: List[ExecutorStatus], tasks: List[int]) -> None:
         """Do nothing.
 
         Args:
             - tasks (task_ids): Not used here.
         """
 
-    def unset_logging(self):
+    def unset_logging(self) -> None:
         """ Mute newly added handlers to the root level, right after calling executor.status
         """
         if self.logger_flag is True:
@@ -151,10 +186,10 @@ class Strategy(object):
 
         self.logger_flag = True
 
-    def _strategy_simple(self, status_list, tasks):
+    def _strategy_simple(self, status_list: "List[PollItem]", tasks: List[int]) -> None:
         self._general_strategy(status_list, tasks, strategy_type='simple')
 
-    def _strategy_htex_auto_scale(self, status_list, tasks):
+    def _strategy_htex_auto_scale(self, status_list: "List[PollItem]", tasks: List[int]) -> None:
         """HTEX specific auto scaling strategy
 
         This strategy works only for HTEX. This strategy will scale up by
@@ -174,7 +209,7 @@ class Strategy(object):
         """
         self._general_strategy(status_list, tasks, strategy_type='htex')
 
-    def _general_strategy(self, status_list, tasks, *, strategy_type):
+    def _general_strategy(self, status_list: "List[PollItem]", tasks: List[int], strategy_type: str) -> None:
         for exec_status in status_list:
             executor = exec_status.executor
             label = executor.label
@@ -191,7 +226,6 @@ class Strategy(object):
             # FIXME probably more of this logic should be moved to the provider
             min_blocks = executor.provider.min_blocks
             max_blocks = executor.provider.max_blocks
-            tasks_per_node = executor.workers_per_node
 
             nodes_per_block = executor.provider.nodes_per_block
             parallelism = executor.provider.parallelism
@@ -199,9 +233,16 @@ class Strategy(object):
             running = sum([1 for x in status.values() if x.state == JobState.RUNNING])
             pending = sum([1 for x in status.values() if x.state == JobState.PENDING])
             active_blocks = running + pending
-            active_slots = active_blocks * tasks_per_node * nodes_per_block
 
-            if hasattr(executor, 'connected_workers'):
+            # TODO: if this isinstance doesn't fire, tasks_per_node and active_slots won't be
+            # set this iteration and either will be unset or will contain a previous executor's value.
+            # in both cases, this is wrong. but apparently mypy doesn't notice.
+
+            if isinstance(executor, HasConnectedWorkers):
+                tasks_per_node = executor.workers_per_node
+
+                active_slots = active_blocks * tasks_per_node * nodes_per_block
+
                 logger.debug('Executor {} has {} active tasks, {}/{} running/pending blocks, and {} connected workers'.format(
                     label, active_tasks, running, pending, executor.connected_workers))
             else:
@@ -233,8 +274,15 @@ class Strategy(object):
                         )
                         self.executors[executor.label]['idle_since'] = time.time()
 
+                    # ... this could be None, type-wise. So why aren't we seeing errors here?
+                    # probably becaues usually if this is None, it will be because active_tasks>0,
+                    # (although I can't see a clear proof that this will always be the case:
+                    # could that setting to None have happened on a previous iteration?)
+
+                    # if idle_since is None, then that means not idle, which means should not
+                    # go down the scale_in path
                     idle_since = self.executors[executor.label]['idle_since']
-                    if (time.time() - idle_since) > self.max_idletime:
+                    if idle_since is not None and (time.time() - idle_since) > self.max_idletime:
                         # We have resources idle for the max duration,
                         # we have to scale_in now.
                         logger.debug("Idle time has reached {}s for executor {}; removing resources".format(
@@ -262,12 +310,12 @@ class Strategy(object):
                     excess = math.ceil((active_tasks * parallelism) - active_slots)
                     excess_blocks = math.ceil(float(excess) / (tasks_per_node * nodes_per_block))
                     excess_blocks = min(excess_blocks, max_blocks - active_blocks)
-                    logger.debug("Requesting {} more blocks".format(excess_blocks))
+                    logger.debug("BENC: strategy: Requesting {} more blocks".format(excess_blocks))
                     exec_status.scale_out(excess_blocks)
 
             elif active_slots == 0 and active_tasks > 0:
                 # Case 4
-                logger.debug("Requesting single slot")
+                logger.debug("BENC: strategy: Requesting single slot")
                 if active_blocks < max_blocks:
                     exec_status.scale_out(1)
 
@@ -284,6 +332,7 @@ class Strategy(object):
                 elif strategy_type == 'simple':
                     # skip for simple strategy
                     pass
+                # TODO how does this elif^ differ from the default case of doing nothing in the implicit missing `else` ? I don't think it does...
 
             # Case 3
             # tasks ~ slots

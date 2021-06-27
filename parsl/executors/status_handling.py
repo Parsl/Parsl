@@ -3,7 +3,7 @@ import threading
 from itertools import compress
 from abc import abstractmethod
 from concurrent.futures import Future
-from typing import List, Any, Dict, Tuple
+from typing import List, Any, Dict, Tuple, Optional
 
 import parsl  # noqa F401
 from parsl.executors.base import ParslExecutor
@@ -13,15 +13,15 @@ logger = logging.getLogger(__name__)
 
 
 class StatusHandlingExecutor(ParslExecutor):
-    def __init__(self, provider):
+    def __init__(self, provider: ExecutionProvider):
         super().__init__()
         self._provider = provider  # type: ExecutionProvider
         # errors can happen during the submit call to the provider; this is used
         # to keep track of such errors so that they can be handled in one place
         # together with errors reported by status()
-        self._simulated_status = {}
+        self._simulated_status = {}  # type: Dict[str, JobStatus]
         self._executor_bad_state = threading.Event()
-        self._executor_exception = None
+        self._executor_exception = None  # type: Optional[Exception]
         self._generated_block_id_counter = 1
         self._tasks = {}  # type: Dict[object, Future]
 
@@ -46,10 +46,11 @@ class StatusHandlingExecutor(ParslExecutor):
 
     @property
     def status_polling_interval(self):
-        if self._provider is None:
-            return 0
-        else:
-            return self._provider.status_polling_interval
+        # this codepath is unreachable because execution provider is always set in init
+        # if self._provider is None:
+        #    return 0
+        # else:
+        return self._provider.status_polling_interval
 
     @abstractmethod
     def _get_block_and_job_ids(self) -> Tuple[List[str], List[Any]]:
@@ -103,7 +104,7 @@ class StatusHandlingExecutor(ParslExecutor):
                       status: Dict[str, JobStatus]) -> bool:
         init_blocks = 3
         if hasattr(self.provider, 'init_blocks'):
-            init_blocks = self.provider.init_blocks  # type: ignore
+            init_blocks = self.provider.init_blocks
         if init_blocks < 1:
             init_blocks = 1
         error_handler.simple_error_handler(self, status, init_blocks)
@@ -160,6 +161,7 @@ class NoStatusHandlingExecutor(ParslExecutor):
     def tasks(self) -> Dict[object, Future]:
         return self._tasks
 
-    @property
-    def provider(self):
-        return self._provider
+    # this property seems to be unimplemented and unused
+    # @property
+    # def provider(self):
+    #    return self._provider

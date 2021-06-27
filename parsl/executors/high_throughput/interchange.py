@@ -13,6 +13,8 @@ import queue
 import threading
 import json
 
+from typing import Any, Dict
+
 from parsl.version import VERSION as PARSL_VERSION
 from parsl.serialize import ParslSerializer
 serialize_object = ParslSerializer().serialize
@@ -180,7 +182,7 @@ class Interchange(object):
         self.hub_address = hub_address
         self.hub_port = hub_port
 
-        self.pending_task_queue = queue.Queue(maxsize=10 ** 6)
+        self.pending_task_queue = queue.Queue(maxsize=10 ** 6)  # type: queue.Queue[Any]
 
         self.worker_ports = worker_ports
         self.worker_port_range = worker_port_range
@@ -208,7 +210,8 @@ class Interchange(object):
         logger.info("Bound to ports {},{} for incoming worker connections".format(
             self.worker_task_port, self.worker_result_port))
 
-        self._ready_manager_queue = {}
+        # this could be tightened up plenty
+        self._ready_manager_queue = {}  # type: Dict[bytes, Any]
 
         self.heartbeat_threshold = heartbeat_threshold
 
@@ -304,6 +307,8 @@ class Interchange(object):
         # Need to create a new ZMQ socket for command server thread
         hub_channel = self._create_monitoring_channel()
 
+        reply: Any  # the type of reply depends on the command_req received (aka this needs dependent types...)
+
         while not kill_event.is_set():
             try:
                 command_req = self.command_channel.recv_pyobj()
@@ -337,7 +342,8 @@ class Interchange(object):
                 elif command_req.startswith("HOLD_WORKER"):
                     cmd, s_manager = command_req.split(';')
                     manager = s_manager.encode('utf-8')
-                    logger.info("[CMD] Received HOLD_WORKER for {}".format(manager))
+                    # mypy dislikes using {} to format `bytes` (rather than strs) because it looks ugly. {!r} forces that.
+                    logger.info("[CMD] Received HOLD_WORKER for {!r}".format(manager))
                     if manager in self._ready_manager_queue:
                         self._ready_manager_queue[manager]['active'] = False
                         reply = True

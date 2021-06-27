@@ -1,7 +1,11 @@
 from abc import ABCMeta, abstractmethod, abstractproperty
 from concurrent.futures import Future
-from typing import Any, Callable, Dict, Optional, List
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
+from parsl.data_provider.staging import Staging
+
+# for type checking:
+from parsl.providers.provider_base import ExecutionProvider
 from parsl.providers.provider_base import JobStatus
 
 import parsl  # noqa F401
@@ -25,25 +29,30 @@ class ParslExecutor(metaclass=ABCMeta):
 
     An executor may optionally expose:
 
-       storage_access: List[parsl.data_provider.staging.Staging] - a list of staging
+       storage_access: Sequence[parsl.data_provider.staging.Staging] - a sequence of staging
               providers that will be used for file staging. In the absence of this
               attribute, or if this attribute is `None`, then a default value of
               ``parsl.data_provider.staging.default_staging`` will be used by the
               staging code.
-
-              Typechecker note: Ideally storage_access would be declared on executor
-              __init__ methods as List[Staging] - however, lists are by default
-              invariant, not co-variant, and it looks like @typeguard cannot be
-              persuaded otherwise. So if you're implementing an executor and want to
-              @typeguard the constructor, you'll have to use List[Any] here.
     """
 
-    label: str
+    # mypy doesn't actually check that the below are defined by
+    # concrete subclasses - see  github.com/python/mypy/issues/4426
+    # and maybe PEP-544 Protocols
 
-    def __enter__(self):
+    label: str
+    provider: ExecutionProvider
+    managed: bool
+    outstanding: Any  # what is this? used by strategy
+    working_dir: Optional[str]
+    storage_access: Optional[Sequence[Staging]]
+    run_id: Optional[str]
+
+    def __enter__(self) -> "ParslExecutor":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    # too lazy to figure out what the three Anys here should be
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Literal[False]:
         self.shutdown()
         return False
 
@@ -56,8 +65,21 @@ class ParslExecutor(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def submit(self, func: Callable, resource_specification: Dict[str, Any], *args: Any, **kwargs: Any) -> Future:
+    def submit(self, func: Callable, resource_specification: Dict[str, Any], *args: Any, **kwargs: Dict[str, Any]) -> Future:
         """Submit.
+
+        We haven't yet decided on what the args to this can be,
+        whether it should just be func, args, kwargs or be the partially evaluated
+        fn
+
+        BENC: based on how ipp uses this, this follows the semantics of async_apply from ipyparallel.
+        Based on how the thread executor works, its:
+
+            https://docs.python.org/3/library/concurrent.futures.html
+            Schedules the callable, fn, to be executed as fn(*args **kwargs) and returns a Future object representing the execution of the callable.
+
+        These are consistent
+
         """
         pass
 
@@ -83,6 +105,11 @@ class ParslExecutor(metaclass=ABCMeta):
         which will have the scaling methods, scale_in itself should be a coroutine, since
         scaling tasks can be slow.
 
+        MYPY branch notes: the scale in calls in strategy expect there to be many
+        more parameters to this. This maybe could be resolved by treating a
+        status providing executor as more generally a strategy-scalable
+        executor, and having strategies statically typed to work on those.
+
         :return: A list of block ids corresponding to the blocks that were removed.
         """
         pass
@@ -106,6 +133,13 @@ class ParslExecutor(metaclass=ABCMeta):
 
     def create_monitoring_info(self, status: Dict[str, JobStatus]) -> List[object]:
         """Create a monitoring message for each block based on the poll status.
+
+        TODO: block_id_type should be an enumerated list of valid strings, rather than all strings
+
+        TODO: there shouldn't be any default values for this - when it is invoked, it should be explicit which is needed?
+        Neither seems more natural to me than the other.
+
+        TODO: internal vs external should be more clearly documented here
 
         :return: a list of dictionaries mapping to the info of each block
         """
@@ -184,7 +218,7 @@ class ParslExecutor(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def set_bad_state_and_fail_all(self, exception: Exception):
+    def set_bad_state_and_fail_all(self, exception: Exception) -> None:
         """Allows external error handlers to mark this executor as irrecoverably bad and cause
         all tasks submitted to it now and in the future to fail. The executor is responsible
         for checking  :method:bad_state_is_set() in the :method:submit() method and raising the
@@ -243,3 +277,9 @@ class ParslExecutor(metaclass=ABCMeta):
     @hub_port.setter
     def hub_port(self, value: Optional[int]) -> None:
         self._hub_port = value
+
+
+class HasConnectedWorkers():
+    """A marker type to indicate that the executor has a count of connected workers"""
+    connected_workers: int
+    workers_per_node: float

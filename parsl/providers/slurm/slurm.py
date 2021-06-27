@@ -15,6 +15,8 @@ from parsl.providers.provider_base import JobState, JobStatus
 from parsl.providers.slurm.template import template_string
 from parsl.utils import RepresentationMixin, wtime_to_minutes
 
+from typing import Any, Dict
+
 logger = logging.getLogger(__name__)
 
 translate_table = {
@@ -165,7 +167,7 @@ class SlurmProvider(ClusterProvider, RepresentationMixin):
             logger.debug("Updating missing job {} to completed status".format(missing_job))
             self.resources[missing_job]['status'] = JobStatus(JobState.COMPLETED)
 
-    def submit(self, command, tasks_per_node, job_name="parsl.slurm"):
+    def submit(self, command, tasks_per_node, job_name="parsl.slurm") -> Optional[str]:
         """Submit the command as a slurm job.
 
         Parameters
@@ -199,7 +201,7 @@ class SlurmProvider(ClusterProvider, RepresentationMixin):
 
         logger.debug("Requesting one block with {} nodes".format(self.nodes_per_block))
 
-        job_config = {}
+        job_config = {}  # type: Dict[str, Any]
         job_config["submit_script_dir"] = self.channel.script_dir
         job_config["nodes"] = self.nodes_per_block
         job_config["tasks_per_node"] = tasks_per_node

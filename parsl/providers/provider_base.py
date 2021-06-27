@@ -1,19 +1,24 @@
 import os
 from abc import ABCMeta, abstractmethod, abstractproperty
 from enum import Enum
-from typing import Any, List, Optional
+import logging
+from typing import Any, Dict, List, Optional
+
+from parsl.channels.base import Channel
+
+logger = logging.getLogger(__name__)
 
 
-class JobState(bytes, Enum):
+# mypy can't typecheck the master version of JobState
+# I hope that this behaves the same.
+# The __repr__ is different at least - with master
+# version: >>> JobState.RUNNING
+# <JobState.RUNNING: 2>
+# with this version:
+# <JobState.RUNNING: (2, False)>
+
+class JobState(Enum):
     """Defines a set of states that a job can be in"""
-
-    def __new__(cls, value, terminal, status_name):
-        # noinspection PyArgumentList
-        obj = bytes.__new__(cls, [value])
-        obj._value_ = value
-        obj.terminal = terminal
-        obj.status_name = status_name
-        return obj
 
     UNKNOWN = (0, False, "UNKNOWN")
     PENDING = (1, False, "PENDING")
@@ -24,13 +29,28 @@ class JobState(bytes, Enum):
     TIMEOUT = (6, True, "TIMEOUT")
     HELD = (7, False, "HELD")
 
+    @property
+    def terminal(self) -> bool:
+        (_, state, _) = self.value
+        return state
+
+    @property
+    def status_name(self) -> str:
+        (_, _, state) = self.value
+        return state
+
 
 class JobStatus(object):
     """Encapsulates a job state together with other details, presently a (error) message"""
     SUMMARY_TRUNCATION_THRESHOLD = 2048
 
-    def __init__(self, state: JobState, message: str = None, exit_code: Optional[int] = None,
-                 stdout_path: str = None, stderr_path: str = None):
+    # mypy as I have configured it requires an explicit optional here.
+    # there was a change in PEP484 that makes this behaviour itself different between
+    # different typecheckers: https://github.com/python/peps/pull/689
+    # previously = None implied Optional on the type, but there has been some pressure
+    # against that - see https://github.com/python/typing/issues/275
+    def __init__(self, state: JobState, message: Optional[str] = None, exit_code: Optional[int] = None,
+                 stdout_path: Optional[str] = None, stderr_path: Optional[str] = None):
         self.state = state
         self.message = message
         self.exit_code = exit_code
@@ -38,43 +58,56 @@ class JobStatus(object):
         self.stderr_path = stderr_path
 
     @property
-    def terminal(self):
+    def terminal(self) -> bool:
         return self.state.terminal
 
     @property
-    def status_name(self):
+    def status_name(self) -> str:
         return self.state.status_name
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         if self.message is not None:
             return "{} ({})".format(self.state, self.message)
         else:
             return "{}".format(self.state)
 
     @property
-    def stdout(self):
-        return self._read_file(self.stdout_path)
+    def stdout(self) -> Optional[str]:
+        if self.stdout_path:
+            return self._read_file(self.stdout_path)
+        else:
+            return None
 
     @property
-    def stderr(self):
-        return self._read_file(self.stderr_path)
+    def stderr(self) -> Optional[str]:
+        if self.stderr_path:
+            return self._read_file(self.stderr_path)
+        else:
+            return None
 
-    def _read_file(self, path):
+    def _read_file(self, path: str) -> Optional[str]:
         try:
             with open(path, 'r') as f:
                 return f.read()
         except Exception:
+            logger.exception("Converting exception to None")
             return None
 
     @property
-    def stdout_summary(self):
-        return self._read_summary(self.stdout_path)
+    def stdout_summary(self) -> Optional[str]:
+        if self.stdout_path:
+            return self._read_summary(self.stdout_path)
+        else:
+            return None
 
     @property
-    def stderr_summary(self):
-        return self._read_summary(self.stderr_path)
+    def stderr_summary(self) -> Optional[str]:
+        if self.stderr_path:
+            return self._read_summary(self.stderr_path)
+        else:
+            return None
 
-    def _read_summary(self, path):
+    def _read_summary(self, path: str) -> Optional[str]:
         if not path:
             # can happen for synthetic job failures
             return None
@@ -84,9 +117,14 @@ class JobStatus(object):
                 size = f.tell()
                 f.seek(0, os.SEEK_SET)
                 if size > JobStatus.SUMMARY_TRUNCATION_THRESHOLD:
-                    head = f.read(JobStatus.SUMMARY_TRUNCATION_THRESHOLD / 2)
-                    f.seek(size - JobStatus.SUMMARY_TRUNCATION_THRESHOLD / 2, os.SEEK_SET)
-                    tail = f.read(JobStatus.SUMMARY_TRUNCATION_THRESHOLD / 2)
+                    # there is a round down here if SUMMARY_TRUNCATION_THRESHOLD
+                    # is not an even number.
+                    # That's probably better than the non-typechecked behaviour
+                    # which was for f.read to fail with being given a float not an int
+                    half_threshold = int(JobStatus.SUMMARY_TRUNCATION_THRESHOLD / 2)
+                    head = f.read(half_threshold)
+                    f.seek(size - half_threshold, os.SEEK_SET)
+                    tail = f.read(half_threshold)
                     return head + '\n...\n' + tail
                 else:
                     f.seek(0, os.SEEK_SET)
@@ -127,8 +165,16 @@ class ExecutionProvider(metaclass=ABCMeta):
     _cores_per_node = None  # type: Optional[int]
     _mem_per_node = None  # type: Optional[float]
 
+    min_blocks: int
+    max_blocks: int
+    init_blocks: int
+    nodes_per_block: int
+    script_dir: Optional[str]
+    parallelism: float  # TODO not sure about this one?
+    resources: Dict[object, Any]  # I think the contents of this are provider-specific?
+
     @abstractmethod
-    def submit(self, command: str, tasks_per_node: int, job_name: str = "parsl.auto") -> Any:
+    def submit(self, command: str, tasks_per_node: int, job_name: str = "parsl.auto") -> object:
         ''' The submit method takes the command string to be executed upon
         instantiation of a resource most often to start a pilot (such as IPP engine
         or even Swift-T engines).
@@ -152,7 +198,7 @@ class ExecutionProvider(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def status(self, job_ids: List[Any]) -> List[JobStatus]:
+    def status(self, job_ids: List[object]) -> List[JobStatus]:
         ''' Get the status of a list of jobs identified by the job identifiers
         returned from the submit request.
 
@@ -170,7 +216,7 @@ class ExecutionProvider(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def cancel(self, job_ids: List[Any]) -> List[bool]:
+    def cancel(self, job_ids: List[object]) -> List[bool]:
         ''' Cancels the resources identified by the job_ids provided by the user.
 
         Args:
@@ -234,3 +280,13 @@ class ExecutionProvider(metaclass=ABCMeta):
         :return: the number of seconds to wait between calls to status()
         """
         pass
+
+
+class Channeled():
+    """A marker type to indicate that parsl should manage a Channel for this provider"""
+    channel: Channel
+
+
+class MultiChanneled():
+    """A marker type to indicate that parsl should manage Channels for this provider"""
+    channels: List[Channel]

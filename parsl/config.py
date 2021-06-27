@@ -1,7 +1,7 @@
 import logging
 import typeguard
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from parsl.utils import RepresentationMixin
 from parsl.executors.base import ParslExecutor
@@ -47,6 +47,8 @@ class Config(RepresentationMixin):
     strategy : str, optional
         Strategy to use for scaling resources according to workflow needs. Can be 'simple' or `None`. If `None`, dynamic
         scaling will be disabled. Default is 'simple'.
+    # TODO: db_logger_config is not documented here. The type is keyword based here, by the looks of it, which might
+    # be better structured as a type-checked config object? For now, I've told mypy it is Optional[Any] which is weak.
     max_idletime : float, optional
         The maximum idle time allowed for an executor before strategy could shut down unused resources (scheduler jobs). Default is 120.0 seconds.
     usage_tracking : bool, optional
@@ -67,7 +69,7 @@ class Config(RepresentationMixin):
     def __init__(self,
                  executors: Optional[List[ParslExecutor]] = None,
                  app_cache: bool = True,
-                 checkpoint_files: Optional[List[str]] = None,
+                 checkpoint_files: Optional[Sequence[str]] = None,
                  checkpoint_mode: Optional[str] = None,
                  checkpoint_period: Optional[str] = None,
                  garbage_collect: bool = True,
@@ -78,7 +80,7 @@ class Config(RepresentationMixin):
                  max_idletime: float = 120.0,
                  monitoring: Optional[MonitoringHub] = None,
                  usage_tracking: bool = False,
-                 initialize_logging: bool = True):
+                 initialize_logging: bool = True) -> None:
         if executors is None:
             executors = [ThreadPoolExecutor()]
         self.executors = executors
@@ -108,11 +110,11 @@ class Config(RepresentationMixin):
         self.monitoring = monitoring
 
     @property
-    def executors(self):
+    def executors(self) -> List[ParslExecutor]:
         return self._executors
 
     @executors.setter
-    def executors(self, executors):
+    def executors(self, executors: List[ParslExecutor]) -> None:
         labels = [e.label for e in executors]
         duplicates = [e for n, e in enumerate(labels) if e in labels[:n]]
         if len(duplicates) > 0:

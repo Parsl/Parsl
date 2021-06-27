@@ -32,7 +32,7 @@ from parsl.executors.errors import ScalingFailed
 from parsl.executors.workqueue import exec_parsl_function
 
 import typeguard
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Sequence, Set
 from parsl.data_provider.staging import Staging
 
 from .errors import WorkQueueTaskFailure
@@ -201,7 +201,7 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
                  port: int = WORK_QUEUE_DEFAULT_PORT,
                  env: Optional[Dict] = None,
                  shared_fs: bool = False,
-                 storage_access: Optional[List[Staging]] = None,
+                 storage_access: Optional[Sequence[Staging]] = None,
                  use_cache: bool = False,
                  source: bool = False,
                  pack: bool = False,
@@ -215,6 +215,13 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
                  worker_executable: str = 'work_queue_worker'):
         NoStatusHandlingExecutor.__init__(self)
         self._provider = provider
+
+        # as benc-mypy has got rid of NoStatusHandlingExecutor.provider
+        # an accessor to _provider, instead set it here explicitly. This
+        # removes the requirement for NoStatusHandlingExecutor to provide
+        # that accessor which won't always work.
+        self.provider = provider
+
         self._scaling_enabled = True
 
         if not _work_queue_enabled:

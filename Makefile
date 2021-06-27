@@ -46,9 +46,11 @@ clean_coverage:
 
 .PHONY: mypy
 mypy: ## run mypy checks
-	MYPYPATH=$(CWD)/mypy-stubs mypy parsl/tests/configs/
-	MYPYPATH=$(CWD)/mypy-stubs mypy parsl/tests/test*/
-	MYPYPATH=$(CWD)/mypy-stubs mypy parsl/tests/sites/
+	PYTHONPATH=.:$(PYTHONPATH) MYPYPATH=$(CWD)/mypy-stubs mypy parsl/tests/configs/
+	PYTHONPATH=.:$(PYTHONPATH) MYPYPATH=$(CWD)/mypy-stubs mypy parsl/tests/sites/
+	PYTHONPATH=.:$(PYTHONPATH) MYPYPATH=$(CWD)/mypy-stubs mypy parsl/app/ parsl/channels/ parsl/dataflow/ parsl/data_provider/ parsl/launchers parsl/providers/
+	PYTHONPATH=$(pwd):$(PYTHONPATH) MYPYPATH=$(CWD)/mypy-stubs mypy typecheck-root.py  parsl/tests/configs/  parsl/tests/sites/ parsl/executors/high_throughput/ parsl/executors/*.py parsl/app/ parsl/channels/ parsl/dataflow/ parsl/data_provider/ parsl/launchers parsl/providers/ parsl/*py parsl/monitoring/*py
+
         # only the top level of monitoring is checked here because the visualization code does not type check
 	MYPYPATH=$(CWD)/mypy-stubs mypy parsl/app/ parsl/channels/ parsl/dataflow/ parsl/data_provider/ parsl/launchers parsl/providers/ parsl/monitoring/*py
         # process worker pool is explicitly listed to check, because it is not
@@ -68,11 +70,12 @@ htex_local_alternate_test: ## run all tests with htex_local config
 	pip3 install ".[monitoring]"
 	PYTHONPATH=.  pytest parsl/tests/ -k "not cleannet" --config parsl/tests/configs/htex_local_alternate.py --cov=parsl --cov-append --cov-report= --random-order
 
-$(WORKQUEUE_INSTALL):
+$(WORKQUEUE_INSTALL)/installed.parsl:
 	parsl/executors/workqueue/install-workqueue.sh
+	touch $(WORKQUEUE_INSTALL)/installed.parsl
 
 .PHONY: workqueue_ex_test
-workqueue_ex_test: $(WORKQUEUE_INSTALL)  ## run all tests with workqueue_ex config
+workqueue_ex_test: $(WORKQUEUE_INSTALL)/installed.parsl  ## run all tests with workqueue_ex config
 	PYTHONPATH=.:/tmp/cctools/lib/python3.5/site-packages  pytest parsl/tests/ -k "not cleannet and not issue363" --config parsl/tests/configs/workqueue_ex.py --cov=parsl --cov-append --cov-report= --random-order
 
 .PHONY: config_local_test

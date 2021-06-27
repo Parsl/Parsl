@@ -14,7 +14,7 @@ from parsl.providers.error import ScaleOutFailed
 
 logger = logging.getLogger(__name__)
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from parsl.channels.base import Channel
 from parsl.launchers.launchers import Launcher
 
@@ -149,7 +149,7 @@ class CondorProvider(RepresentationMixin, ClusterProvider):
             state = translate_table.get(parts[1], JobState.UNKNOWN)
             self.resources[job_id]['status'] = JobStatus(state)
 
-    def status(self, job_ids):
+    def status(self, job_ids: List[Any]) -> List[JobStatus]:
         """Get the status of a list of jobs identified by their ids.
 
         Parameters
@@ -255,7 +255,7 @@ class CondorProvider(RepresentationMixin, ClusterProvider):
         except Exception as e:
             raise ScaleOutFailed(self.label, str(e))
 
-        job_id = []
+        job_id = []  # type: List[str]
 
         if retcode == 0:
             for line in stdout.split('\n'):

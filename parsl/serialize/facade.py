@@ -1,6 +1,8 @@
 from parsl.serialize.concretes import *  # noqa: F403,F401
-from parsl.serialize.base import METHODS_MAP_DATA, METHODS_MAP_CODE
+from parsl.serialize.base import METHODS_MAP_DATA, METHODS_MAP_CODE, SerializerBase
 import logging
+
+from typing import Any, Dict, List, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -10,15 +12,15 @@ class ParslSerializer(object):
     """
     __singleton_instance = None
 
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls) -> "ParslSerializer":  # quotes on type here because we haven't finished definining ParslSerializer yet, I think
         """ Make ParslSerializer a singleton using the fact that there's only one instance
         of a class variable
         """
         if ParslSerializer.__singleton_instance is None:
-            ParslSerializer.__singleton_instance = object.__new__(cls, *args, **kwargs)
+            ParslSerializer.__singleton_instance = object.__new__(cls)
         return ParslSerializer.__singleton_instance
 
-    def __init__(self):
+    def __init__(self) -> None:
         """ Instantiate the appropriate classes
         """
         headers = list(METHODS_MAP_CODE.keys()) + list(METHODS_MAP_DATA.keys())
@@ -34,10 +36,10 @@ class ParslSerializer(object):
         for key in METHODS_MAP_DATA:
             self.methods_for_data[key] = METHODS_MAP_DATA[key]()
 
-    def _list_methods(self):
+    def _list_methods(self) -> Tuple[Dict[bytes, SerializerBase], Dict[bytes, SerializerBase]]:
         return self.methods_for_code, self.methods_for_data
 
-    def pack_apply_message(self, func, args, kwargs, buffer_threshold=128 * 1e6):
+    def pack_apply_message(self, func: Any, args: Any, kwargs: Any, buffer_threshold: int = int(128 * 1e6)) -> bytes:
         """Serialize and pack function and parameters
 
         Parameters
@@ -62,53 +64,48 @@ class ParslSerializer(object):
         packed_buffer = self.pack_buffers([b_func, b_args, b_kwargs])
         return packed_buffer
 
-    def unpack_apply_message(self, packed_buffer, user_ns=None, copy=False):
+    def unpack_apply_message(self, packed_buffer: bytes, user_ns: Any = None, copy: Any = False) -> List[Any]:
         """ Unpack and deserialize function and parameters
 
         """
         return [self.deserialize(buf) for buf in self.unpack_buffers(packed_buffer)]
 
-    def serialize(self, obj, buffer_threshold=1e6):
+    def serialize(self, obj: Any, buffer_threshold: int = int(1e6)) -> bytes:
         """ Try available serialization methods one at a time
 
         Individual serialization methods might raise a TypeError (eg. if objects are non serializable)
         This method will raise the exception from the last method that was tried, if all methods fail.
         """
-        serialized = None
-        serialized_flag = False
-        last_exception = None
+        result: Union[bytes, Exception]
         if callable(obj):
             for method in self.methods_for_code.values():
                 try:
-                    serialized = method.serialize(obj)
+                    result = method.serialize(obj)
                     # We attempt a deserialization to make sure both work.
-                    method.deserialize(serialized)
+                    method.deserialize(result)
                 except Exception as e:
-                    last_exception = e
+                    result = e
                     continue
                 else:
-                    serialized_flag = True
                     break
         else:
             for method in self.methods_for_data.values():
                 try:
-                    serialized = method.serialize(obj)
+                    result = method.serialize(obj)
                 except Exception as e:
-                    last_exception = e
+                    result = e
                     continue
                 else:
-                    serialized_flag = True
                     break
 
-        if serialized_flag is False:
-            # TODO : Replace with a SerializationError
-            raise last_exception
+        if isinstance(result, BaseException):
+            raise result
+        else:
+            if len(result) > buffer_threshold:
+                logger.warning(f"Serialized object exceeds buffer threshold of {buffer_threshold} bytes, this could cause overflows")
+            return result
 
-        if len(serialized) > buffer_threshold:
-            logger.warning(f"Serialized object exceeds buffer threshold of {buffer_threshold} bytes, this could cause overflows")
-        return serialized
-
-    def deserialize(self, payload):
+    def deserialize(self, payload: bytes) -> Any:
         """
         Parameters
         ----------
@@ -122,11 +119,11 @@ class ParslSerializer(object):
         elif header in self.methods_for_data:
             result = self.methods_for_data[header].deserialize(payload)
         else:
-            raise TypeError("Invalid header: {} in data payload. Buffer is either corrupt or not created by ParslSerializer".format(header))
+            raise TypeError("Invalid header: {!r} in data payload. Buffer is either corrupt or not created by ParslSerializer".format(header))
 
         return result
 
-    def pack_buffers(self, buffers):
+    def pack_buffers(self, buffers: List[bytes]) -> bytes:
         """
         Parameters
         ----------
@@ -139,7 +136,7 @@ class ParslSerializer(object):
 
         return packed
 
-    def unpack_buffers(self, packed_buffer):
+    def unpack_buffers(self, packed_buffer: bytes) -> List[bytes]:
         """
         Parameters
         ----------
@@ -154,7 +151,7 @@ class ParslSerializer(object):
 
         return unpacked
 
-    def unpack_and_deserialize(self, packed_buffer):
+    def unpack_and_deserialize(self, packed_buffer: bytes) -> List[Any]:
         """ Unpacks a packed buffer and returns the deserialized contents
         Parameters
         ----------

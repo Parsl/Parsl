@@ -1,6 +1,6 @@
 """Exceptions raised by Apps."""
 from functools import wraps
-from typing import Callable, List, Union, Any, TypeVar
+from typing import List, Any
 from types import TracebackType
 
 import dill
@@ -11,6 +11,14 @@ from six import reraise
 
 from parsl.data_provider.files import File
 
+
+# vs PR 1846: benc-mypy imports File from the data_provider module
+# more directly, potentially to avoid import loops from trying to
+# import the top level "parsl" here.
+# from parsl import File
+
+# vs PR 1846: see TypeVar playing in response to PR 1846 TODO
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,13 +26,6 @@ class ParslError(Exception):
     """Base class for all exceptions.
 
     Only to be invoked when a more specific error is not available.
-    """
-
-
-class NotFutureError(ParslError):
-    """A non future item was passed to a function that expected a future.
-
-    This is basically a type error.
     """
 
 
@@ -78,7 +79,10 @@ class MissingOutputs(ParslError):
     outputs(List of strings/files..)
     """
 
-    def __init__(self, reason: str, outputs: List[Union[str, File]]) -> None:
+    # vs PR 1846:  I use List[File] for outputs; this PR uses a union of str or File
+    # That might be because I've done other tidyup work regarding strings and files?
+
+    def __init__(self, reason: str, outputs: List[File]) -> None:
         super().__init__(reason, outputs)
         self.reason = reason
         self.outputs = outputs
@@ -92,7 +96,6 @@ class BadStdStreamFile(ParslError):
 
     Contains:
        reason(string)
-       outputs(List of strings/files..)
        exception object
     """
 
@@ -131,32 +134,23 @@ class RemoteExceptionWrapper:
         reraise(t, v, tb)
 
 
-R = TypeVar('R')
+# vs PR 1846: PR 1846 makes wrap_error go from any callable to any callable
+# and typechecks without casts.
 
-# There appears to be no solution to typing this without a mypy plugin.
-# The reason is because wrap_error maps a Callable[[X...], R] to a Callable[[X...], Union[R, R2]].
-# However, there is no provision in Python typing for pattern matching all possible types of
-# callable arguments. This is because Callable[] is, in the infinite wisdom of the typing module,
-# only used for callbacks: "There is no syntax to indicate optional or keyword arguments; such
-# function types are rarely used as callback types.".
-# The alternative supported by the typing module, of saying Callable[..., R] ->
-#   Callable[..., Union[R, R2]] results in no pattern matching between the first and second
-# ellipsis.
-# Yet another bogus solution that was here previously would simply define wrap_error as
-#   wrap_error(T) -> T, where T was a custom TypeVar. This obviously missed the fact that
-# the returned function had its return signature modified.
-# Ultimately, the best choice appears to be Callable[..., R] -> Callable[..., Union[R, ?Exception]],
-#  since it results in the correct type specification for the return value(s) while treating the
-#  arguments as Any.
+# see https://github.com/dry-python/returns/blob/92eda5574a8e41f4f5af4dd29887337886301ee3/returns/contrib/mypy/decorator_plugin.py
+# for a mypy plugin to do this in a hacky way
+# and this issue for more info on typing decorators:
 
+# https://github.com/python/mypy/issues/3157
 
-def wrap_error(func: Callable[..., R]) -> Callable[..., Union[R, RemoteExceptionWrapper]]:
-    @wraps(func)  # type: ignore
+def wrap_error(func):
+    @wraps(func)
     def wrapper(*args: object, **kwargs: object) -> Any:
         import sys
         from parsl.app.errors import RemoteExceptionWrapper
         try:
-            return func(*args, **kwargs)  # type: ignore
+            return func(*args, **kwargs)
         except Exception:
             return RemoteExceptionWrapper(*sys.exc_info())
-    return wrapper  # type: ignore
+
+    return wrapper

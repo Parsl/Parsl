@@ -7,12 +7,13 @@ import datetime
 import pickle
 from multiprocessing import Process, Queue
 from typing import Dict  # noqa F401 (used in type annotation)
-from typing import List, Optional, Tuple, Union, Any
+from typing import List, Optional, Tuple, Union, Any, Sequence
 import math
 
 from parsl.serialize import pack_apply_message, deserialize
 from parsl.app.errors import RemoteExceptionWrapper
 from parsl.executors.high_throughput import zmq_pipes
+from parsl.executors.base import HasConnectedWorkers
 from parsl.executors.high_throughput import interchange
 from parsl.executors.errors import (
     BadMessage, ScalingFailed,
@@ -32,7 +33,7 @@ from parsl.providers import LocalProvider
 logger = logging.getLogger(__name__)
 
 
-class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
+class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin, HasConnectedWorkers):
     """Executor designed for cluster-scale
 
     The HighThroughputExecutor system has the following components:
@@ -164,6 +165,8 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
         In case of a remote file system, specify the path to where logs will be kept.
     """
 
+    _queue_management_thread: Optional[threading.Thread]
+
     @typeguard.typechecked
     def __init__(self,
                  label: str = 'HighThroughputExecutor',
@@ -173,7 +176,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
                  worker_ports: Optional[Tuple[int, int]] = None,
                  worker_port_range: Optional[Tuple[int, int]] = (54000, 55000),
                  interchange_port_range: Optional[Tuple[int, int]] = (55000, 56000),
-                 storage_access: Optional[List[Staging]] = None,
+                 storage_access: Optional[Sequence[Staging]] = None,
                  working_dir: Optional[str] = None,
                  worker_debug: bool = False,
                  cores_per_worker: float = 1.0,
@@ -192,7 +195,6 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
 
         StatusHandlingExecutor.__init__(self, provider)
         self.label = label
-        self.launch_cmd = launch_cmd
         self.worker_debug = worker_debug
         self.storage_access = storage_access
         self.working_dir = working_dir
@@ -229,6 +231,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
         self.run_id = None  # set to the correct run_id in dfk
         self.hub_address = None  # set to the correct hub address in dfk
         self.hub_port = None  # set to the correct hub port in dfk
+
         self.worker_ports = worker_ports
         self.worker_port_range = worker_port_range
         self.interchange_port_range = interchange_port_range
@@ -239,7 +242,11 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
         self.worker_logdir_root = worker_logdir_root
         self.cpu_affinity = cpu_affinity
 
-        if not launch_cmd:
+        self._executor_exception = None
+
+        if launch_cmd:
+            self.launch_cmd = launch_cmd
+        else:
             self.launch_cmd = ("process_worker_pool.py {debug} {max_workers} "
                                "-a {addresses} "
                                "-p {prefetch_capacity} "
@@ -255,7 +262,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
                                "--hb_threshold={heartbeat_threshold} "
                                "--cpu-affinity {cpu_affinity} ")
 
-    def initialize_scaling(self):
+    def initialize_scaling(self) -> List[str]:
         """ Compose the launch command and call the scale_out
 
         This should be implemented in the child classes to take care of
@@ -293,7 +300,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
         logger.debug("Starting HighThroughputExecutor with provider:\n%s", self.provider)
 
         # TODO: why is this a provider property?
-        block_ids = []
+        block_ids = []  # type: List[str]
         if hasattr(self.provider, 'init_blocks'):
             try:
                 block_ids = self.scale_out(blocks=self.provider.init_blocks)
@@ -302,7 +309,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
                 raise e
         return block_ids
 
-    def start(self):
+    def start(self) -> Optional[List[str]]:
         """Create the Interchange process and connect to it.
         """
         self.outgoing_q = zmq_pipes.TasksOutgoing("127.0.0.1", self.interchange_port_range)
@@ -321,7 +328,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
         return block_ids
 
     @wrap_with_logs
-    def _queue_management_worker(self):
+    def _queue_management_worker(self) -> None:
         """Listen to the queue for task status messages and handle them.
 
         Depending on the message, tasks will be updated with results, exceptions,
@@ -426,13 +433,13 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
                 break
         logger.info("[MTHREAD] queue management worker finished")
 
-    def _start_local_queue_process(self):
+    def _start_local_queue_process(self) -> None:
         """ Starts the interchange process locally
 
         Starts the interchange process locally and uses an internal command queue to
         get the worker task and result ports that the interchange has bound to.
         """
-        comm_q = Queue(maxsize=10)
+        comm_q = Queue(maxsize=10)  # type: Queue[Any]
         self.queue_proc = Process(target=interchange.starter,
                                   args=(comm_q,),
                                   kwargs={"client_ports": (self.outgoing_q.port,
@@ -457,7 +464,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
             logger.error("Interchange has not completed initialization in 120s. Aborting")
             raise Exception("Interchange failed to start")
 
-    def _start_queue_management_thread(self):
+    def _start_queue_management_thread(self) -> None:
         """Method to start the management thread as a daemon.
 
         Checks if a thread already exists, then starts it.
@@ -473,7 +480,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
         else:
             logger.debug("Management thread already exists, returning")
 
-    def hold_worker(self, worker_id):
+    def hold_worker(self, worker_id: str) -> None:
         """Puts a worker on hold, preventing scheduling of additional tasks to it.
 
         This is called "hold" mostly because this only stops scheduling of tasks,
@@ -485,9 +492,8 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
         worker_id : str
             Worker id to be put on hold
         """
-        c = self.command_client.run("HOLD_WORKER;{}".format(worker_id))
+        self.command_client.run("HOLD_WORKER;{}".format(worker_id))
         logger.debug("Sent hold request to worker: {}".format(worker_id))
-        return c
 
     @property
     def outstanding(self):
@@ -504,7 +510,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
         workers = self.command_client.run("MANAGERS")
         return workers
 
-    def _hold_block(self, block_id):
+    def _hold_block(self, block_id: str) -> None:
         """ Sends hold command to all managers which are in a specific block
 
         Parameters
@@ -520,7 +526,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
                 logger.debug("[HOLD_BLOCK]: Sending hold to manager: {}".format(manager['manager']))
                 self.hold_worker(manager['manager'])
 
-    def submit(self, func, resource_specification, *args, **kwargs):
+    def submit(self, func, resource_specification, *args, **kwargs) -> "Future[Any]":
         """Submits work to the the outgoing_q.
 
         The outgoing_q is an external process listens on this
@@ -544,7 +550,10 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
             raise UnsupportedFeatureError('resource specification', 'HighThroughput Executor', 'WorkQueue Executor')
 
         if self.bad_state_is_set:
-            raise self.executor_exception
+            if self.executor_exception is None:
+                raise ValueError("Executor is in bad state, but no exception recorded")
+            else:
+                raise self.executor_exception
 
         self._task_counter += 1
         task_id = self._task_counter
@@ -555,7 +564,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
             args_to_print = tuple([arg if len(repr(arg)) < 100 else (repr(arg)[:100] + '...') for arg in args])
         logger.debug("Pushing function {} to queue with args {}".format(func, args_to_print))
 
-        fut = Future()
+        fut: Future = Future()
         self.tasks[task_id] = fut
 
         try:
@@ -583,7 +592,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
         """
         msg = []
         for bid, s in status.items():
-            d = {}
+            d: Dict[str, Any] = {}
             d['run_id'] = self.run_id
             d['status'] = s.status_name
             d['timestamp'] = datetime.datetime.now()
@@ -593,12 +602,12 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
             msg.append(d)
         return msg
 
-    def scale_out(self, blocks=1):
+    def scale_out(self, blocks=1) -> List[str]:
         """Scales out the number of blocks by "blocks"
         """
         if not self.provider:
-            raise (ScalingFailed(None, "No execution provider available"))
-        block_ids = []
+            raise ScalingFailed(None, "No execution provider available")
+        block_ids = []  # type: List[str]
         for i in range(blocks):
             block_id = str(len(self.blocks))
             try:
@@ -622,7 +631,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
                                 "Attempts to provision nodes via provider has failed"))
         return job_id
 
-    def scale_in(self, blocks=None, block_ids=[], force=True, max_idletime=None):
+    def scale_in(self, blocks: Optional[int] = None, block_ids: List[str] = [], force: bool = True, max_idletime: Optional[float] = None) -> List[str]:
         """Scale in the number of active blocks by specified amount.
 
         The scale in method here is very rude. It doesn't give the workers
@@ -712,7 +721,7 @@ class HighThroughputExecutor(StatusHandlingExecutor, RepresentationMixin):
             job_ids.append(self.blocks[bid])
         return block_ids, job_ids
 
-    def shutdown(self, hub=True, targets='all', block=False):
+    def shutdown(self, hub: bool = True, targets: Union[str, List[int]] = 'all', block: bool = False) -> bool:
         """Shutdown the executor, including all workers and controllers.
 
         This is not implemented.

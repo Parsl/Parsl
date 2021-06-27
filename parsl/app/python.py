@@ -6,6 +6,7 @@ tblib.pickling_support.install()
 from parsl.app.app import AppBase
 from parsl.app.errors import wrap_error
 from parsl.dataflow.dflow import DataFlowKernelLoader
+from parsl.dataflow.futures import AppFuture
 
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ def timeout(f, seconds):
 class PythonApp(AppBase):
     """Extends AppBase to cover the Python App."""
 
-    def __init__(self, func, data_flow_kernel=None, cache=False, executors='all', ignore_for_cache=[], join=False):
+    def __init__(self, func, data_flow_kernel=None, cache=False, executors='all', ignore_for_cache=[], join: bool = False) -> None:
         super().__init__(
             wrap_error(func),
             data_flow_kernel=data_flow_kernel,
@@ -45,7 +46,7 @@ class PythonApp(AppBase):
         )
         self.join = join
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs) -> AppFuture:
         """This is where the call to a python app is handled.
 
         Args:

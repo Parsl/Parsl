@@ -78,7 +78,6 @@ Executors
     parsl.executors.ExtremeScaleExecutor
     parsl.executors.LowLatencyExecutor
     parsl.executors.FluxExecutor
-    parsl.executors.swift_t.TurbineExecutor
 
 Launchers
 =========
@@ -135,7 +134,6 @@ Exceptions
     parsl.app.errors.BashAppNoReturn
     parsl.app.errors.BashExitFailure
     parsl.app.errors.MissingOutputs
-    parsl.app.errors.NotFutureError
     parsl.app.errors.ParslError
     parsl.errors.OptionalModuleMissing
     parsl.executors.errors.ExecutorError

@@ -4,12 +4,16 @@ from string import Template
 
 from parsl.providers.error import SchedulerMissingArgs, ScriptPathError
 from parsl.launchers.error import BadLauncher
-from parsl.providers.provider_base import ExecutionProvider
+from parsl.providers.provider_base import ExecutionProvider, Channeled, JobStatus
 
 logger = logging.getLogger(__name__)
 
+from typing import Any, Dict, List
+from parsl.channels.base import Channel
+from parsl.launchers.launchers import Launcher
 
-class ClusterProvider(ExecutionProvider):
+
+class ClusterProvider(ExecutionProvider, Channeled):
     """ This class defines behavior common to all cluster/supercompute-style scheduler systems.
 
     Parameters
@@ -45,16 +49,16 @@ class ClusterProvider(ExecutionProvider):
     """
 
     def __init__(self,
-                 label,
-                 channel,
-                 nodes_per_block,
-                 init_blocks,
-                 min_blocks,
-                 max_blocks,
-                 parallelism,
-                 walltime,
-                 launcher,
-                 cmd_timeout=10):
+                 label: str,
+                 channel: Channel,
+                 nodes_per_block: int,
+                 init_blocks: int,
+                 min_blocks: int,
+                 max_blocks: int,
+                 parallelism: float,  # nb. the member field for this is used by strategy, so maybe this should be exposed at the layer above as a property?
+                 walltime: str,
+                 launcher: Launcher,
+                 cmd_timeout: int = 10) -> None:
 
         self._label = label
         self.channel = channel
@@ -66,15 +70,24 @@ class ClusterProvider(ExecutionProvider):
         self.launcher = launcher
         self.walltime = walltime
         self.cmd_timeout = cmd_timeout
-        if not callable(self.launcher):
+
+        # TODO: this test should be for being a launcher, not being callable
+        if not isinstance(self.launcher, Launcher):
             raise(BadLauncher(self.launcher,
-                              "Launcher for executor: {} is of type: {}. Expects a parsl.launcher.launcher.Launcher or callable".format(
-                                  label, type(self.launcher))))
+                              "Launcher for executor: {} is of type: {}. Expects a parsl.launcher.launcher.Launcher".format(label, type(self.launcher))))
 
         self.script_dir = None
 
         # Dictionary that keeps track of jobs, keyed on job_id
-        self.resources = {}
+        self.resources = {}  # type: Dict[Any, Any]
+
+    # This annotation breaks slurm:
+    # parsl/providers/slurm/slurm.py:201: error: Item "None" of "Optional[str]" has no attribute "split"
+    # parsl/providers/slurm/slurm.py:207: error: Item "None" of "Optional[str]" has no attribute "strip"
+    # Theres a dependent type at work here which I can't describe in the type system:
+    # the optional strs are None when int != 0, for some providers.
+    # and when int == 0, the optional strs are strs
+    # def execute_wait(self, cmd, timeout=None) -> Tuple[int, Optional[str], Optional[str]]:
 
     def execute_wait(self, cmd, timeout=None):
         t = self.cmd_timeout
@@ -125,7 +138,7 @@ class ClusterProvider(ExecutionProvider):
     def _status(self):
         pass
 
-    def status(self, job_ids):
+    def status(self, job_ids: List[Any]) -> List[JobStatus]:
         """ Get the status of a list of jobs identified by the job identifiers
         returned from the submit request.
 

@@ -16,18 +16,25 @@ import json
 import psutil
 import multiprocessing
 
-from parsl.process_loggers import wrap_with_logs
+from typing import Any, Dict
 
+from parsl.process_loggers import wrap_with_logs
 from parsl.version import VERSION as PARSL_VERSION
 from parsl.app.errors import RemoteExceptionWrapper
 from parsl.executors.high_throughput.errors import WorkerLost
 from parsl.executors.high_throughput.probe import probe_addresses
+
+# MYPY: flipped this so that mpQueue gets a type Type[Queue], rather than Type[mac_safe_queue]
+# This means that both imports satisfy that type annotation, as mac_safe_queue is a subclass
+# of multiprocessing.Queue, but not vice-versa.
 if platform.system() != 'Darwin':
     from multiprocessing import Queue as mpQueue
 else:
     from parsl.executors.high_throughput.mac_safe_queue import MacSafeQueue as mpQueue
 
 from parsl.serialize import unpack_apply_message, serialize
+
+logger = logging.getLogger("parsl")
 
 HEARTBEAT_CODE = (2 ** 32) - 1
 
@@ -173,9 +180,9 @@ class Manager(object):
                                 math.floor(cores_on_node / cores_per_worker))
         logger.info("Manager will spawn {} workers".format(self.worker_count))
 
-        self.pending_task_queue = mpQueue()
-        self.pending_result_queue = mpQueue()
-        self.ready_worker_queue = mpQueue()
+        self.pending_task_queue = mpQueue()  # type: mpQueue[Any]
+        self.pending_result_queue = mpQueue()  # type: mpQueue[Any]
+        self.ready_worker_queue = mpQueue()  # type: mpQueue[Any]
 
         self.max_queue_size = self.prefetch_capacity + self.worker_count
 
@@ -376,16 +383,16 @@ class Manager(object):
 
         logger.critical("[WORKER_WATCHDOG_THREAD] Exiting")
 
-    def start(self):
+    def start(self) -> None:
         """ Start the worker processes.
 
         TODO: Move task receiving to a thread
         """
         start = time.time()
         self._kill_event = threading.Event()
-        self._tasks_in_progress = multiprocessing.Manager().dict()
+        self._tasks_in_progress = multiprocessing.Manager().dict()  # type: Dict[Any, Any]
 
-        self.procs = {}
+        self.procs = {}  # type: Dict[Any, Any]
         for worker_id in range(self.worker_count):
             p = multiprocessing.Process(target=worker, args=(worker_id,
                                                              self.uid,
@@ -469,7 +476,7 @@ def execute_task(bufs):
 
 
 @wrap_with_logs(target="worker_log")
-def worker(worker_id, pool_id, pool_size, task_queue, result_queue, worker_queue, tasks_in_progress, cpu_affinity):
+def worker(worker_id, pool_id, pool_size, task_queue, result_queue, worker_queue, tasks_in_progress, cpu_affinity) -> None:
     """
 
     Put request token into queue
@@ -533,7 +540,7 @@ def worker(worker_id, pool_id, pool_size, task_queue, result_queue, worker_queue
 
         try:
             result = execute_task(req['buffer'])
-            serialized_result = serialize(result, buffer_threshold=1e6)
+            serialized_result = serialize(result, buffer_threshold=int(1e6))
         except Exception as e:
             logger.info('Caught an exception: {}'.format(e))
             result_package = {'task_id': tid, 'exception': serialize(RemoteExceptionWrapper(*sys.exc_info()))}

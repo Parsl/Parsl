@@ -11,6 +11,16 @@ from typing_extensions import Literal
 
 from parsl.dataflow.dflow import DataFlowKernel
 
+from typing import TYPE_CHECKING
+from typing import Callable
+
+if TYPE_CHECKING:
+    from typing import Dict
+    from typing import Any
+
+from parsl.dataflow.futures import AppFuture
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,7 +32,12 @@ class AppBase(metaclass=ABCMeta):
 
     """
 
-    def __init__(self, func, data_flow_kernel=None, executors='all', cache=False, ignore_for_cache=None):
+    @typeguard.typechecked
+    def __init__(self, func: Callable,
+                 data_flow_kernel: Optional[DataFlowKernel] = None,
+                 executors: Union[List[str], Literal['all']] = 'all',
+                 cache: bool = False,
+                 ignore_for_cache=None) -> None:
         """Construct the App object.
 
         Args:
@@ -45,13 +60,15 @@ class AppBase(metaclass=ABCMeta):
         self.executors = executors
         self.cache = cache
         self.ignore_for_cache = ignore_for_cache
-        if not (isinstance(executors, list) or isinstance(executors, str)):
-            logger.error("App {} specifies invalid executor option, expects string or list".format(
-                func.__name__))
+
+        # unreachable if properly typechecked
+        # if not (isinstance(executors, list) or isinstance(executors, str)):
+        #    logger.error("App {} specifies invalid executor option, expects string or list".format(
+        #        func.__name__))
 
         params = signature(func).parameters
 
-        self.kwargs = {}
+        self.kwargs = {}  # type: Dict[str, Any]
         if 'stdout' in params:
             self.kwargs['stdout'] = params['stdout'].default
         if 'stderr' in params:
@@ -64,7 +81,7 @@ class AppBase(metaclass=ABCMeta):
         self.inputs = params['inputs'].default if 'inputs' in params else []
 
     @abstractmethod
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs) -> AppFuture:
         pass
 
 

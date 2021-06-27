@@ -10,6 +10,11 @@ from concurrent.futures import Future
 import logging
 import threading
 
+from typing import List, Optional
+
+from parsl.dataflow.taskrecord import TaskRecord
+from parsl.app.futures import DataFuture
+
 logger = logging.getLogger(__name__)
 
 # Possible future states (for internal use by the futures package).
@@ -55,7 +60,7 @@ class AppFuture(Future):
 
     """
 
-    def __init__(self, task_def):
+    def __init__(self, task_def: TaskRecord) -> None:
         """Initialize the AppFuture.
 
         Args:
@@ -66,28 +71,28 @@ class AppFuture(Future):
         """
         super().__init__()
         self._update_lock = threading.Lock()
-        self._outputs = []
+        self._outputs = []  # type: List[DataFuture]
         self.task_def = task_def
 
     @property
-    def stdout(self):
+    def stdout(self) -> Optional[str]:
         return self.task_def['kwargs'].get('stdout')
 
     @property
-    def stderr(self):
+    def stderr(self) -> Optional[str]:
         return self.task_def['kwargs'].get('stderr')
 
     @property
-    def tid(self):
+    def tid(self) -> int:
         return self.task_def['id']
 
-    def cancel(self):
+    def cancel(self) -> bool:
         raise NotImplementedError("Cancel not implemented")
 
-    def cancelled(self):
+    def cancelled(self) -> bool:
         return False
 
-    def task_status(self):
+    def task_status(self) -> str:
         """Returns the status of the task that will provide the value
            for this future.  This may not be in-sync with the result state
            of this future - for example, task_status might return 'done' but
@@ -111,10 +116,10 @@ class AppFuture(Future):
         return self.task_def['status'].name
 
     @property
-    def outputs(self):
+    def outputs(self) -> List[DataFuture]:
         return self._outputs
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return '<%s super=%s>' % (
             self.__class__.__name__,
             super().__repr__())

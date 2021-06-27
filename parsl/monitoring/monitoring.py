@@ -169,7 +169,8 @@ class MonitoringHub(RepresentationMixin):
              The time interval, in seconds, at which the monitoring records the resource usage of each task. Default: 30 seconds
         """
 
-        self.logger = logger
+        # previously this was set in start() but logger exists at import so it can be set here and remove the optionality of self.logger's type
+        self.logger = logger  # type: logging.Logger
 
         # Any is used to disable typechecking on uses of _dfk_channel,
         # because it is used in the code as if it points to a channel, but
@@ -212,6 +213,7 @@ class MonitoringHub(RepresentationMixin):
         self.dfk_channel_timeout = 10000  # in milliseconds
         self._context = zmq.Context()
         self._dfk_channel = self._context.socket(zmq.DEALER)
+
         self._dfk_channel.setsockopt(zmq.SNDTIMEO, self.dfk_channel_timeout)
         self._dfk_channel.set_hwm(0)
         self.dfk_port = self._dfk_channel.bind_to_random_port("tcp://{}".format(self.client_address),
