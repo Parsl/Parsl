@@ -2,18 +2,25 @@ import errno
 import logging
 import os
 
-import paramiko
+try:
+    import paramiko
+
+    class NoAuthSSHClient(paramiko.SSHClient):
+
+        def _auth(self, username, *args):
+            self._transport.auth_none(username)
+            return
+
+except ImportError:
+    _paramiko_enabled = False
+else:
+    _paramiko_enabled = True
+
 from parsl.channels.base import Channel
 from parsl.channels.errors import BadHostKeyException, AuthException, SSHException, BadScriptPath, BadPermsScriptPath, FileCopyException
 from parsl.utils import RepresentationMixin
 
 logger = logging.getLogger(__name__)
-
-
-class NoAuthSSHClient(paramiko.SSHClient):
-    def _auth(self, username, *args):
-        self._transport.auth_none(username)
-        return
 
 
 class SSHChannel(Channel, RepresentationMixin):
@@ -45,6 +52,9 @@ class SSHChannel(Channel, RepresentationMixin):
 
         Raises:
         '''
+
+        if not _paramiko_enabled:
+            raise ImportError("Paramiko is missing")
 
         self.hostname = hostname
         self.username = username
