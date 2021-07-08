@@ -16,6 +16,10 @@ from parsl.dataflow.dflow import DataFlowKernelLoader
 
 logger = logging.getLogger('parsl')
 
+pytest_plugins = [
+    "parsl.tests.statefixtures"
+]
+
 
 def dumpstacks(sig, frame):
     s = ''
