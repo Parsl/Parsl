@@ -75,12 +75,18 @@ $(WORKQUEUE_INSTALL):
 workqueue_ex_test: $(WORKQUEUE_INSTALL)  ## run all tests with workqueue_ex config
 	PYTHONPATH=.:/tmp/cctools/lib/python3.5/site-packages  pytest parsl/tests/ -k "not cleannet and not issue363" --config parsl/tests/configs/workqueue_ex.py --cov=parsl --cov-append --cov-report= --random-order
 
+.PHONY: workqueue_mon_test
+workqueue_mon_test: $(WORKQUEUE_INSTALL)  ## run all tests with workqueue_ex config
+	pip3 install ".[monitoring]"
+	PYTHONPATH=.:/tmp/cctools/lib/python3.5/site-packages  pytest parsl/tests/ -k "not cleannet and not issue363" --config parsl/tests/configs/workqueue_monitoring_config.py --cov=parsl --cov-append --cov-report= --random-order
+
+
 .PHONY: config_local_test
 config_local_test: ## run all tests with workqueue_ex config
 	echo "$(MPI)"
 	parsl/executors/extreme_scale/install-mpi.sh $(MPI)
 	pip3 install ".[extreme_scale,monitoring]"
-	PYTHONPATH=. pytest parsl/tests/ -k "not cleannet" --config local --cov=parsl --cov-append --cov-report= --random-order
+	PYTHONPATH=.:/tmp/cctools/lib/python3.5/site-packages pytest parsl/tests/ -k "not cleannet" --config local --cov=parsl --cov-append --cov-report= --random-order
 
 .PHONY: site_test
 site_test:
@@ -88,7 +94,7 @@ site_test:
 	pytest parsl/tests/site_tests/ ${SHARED_FS_OPTIONS} --config local
 
 .PHONY: test ## run all tests with all config types
-test: clean_coverage lint flake8 mypy local_thread_test htex_local_test htex_local_alternate_test workqueue_ex_test  config_local_test ## run all tests
+test: clean_coverage lint flake8 mypy local_thread_test htex_local_test htex_local_alternate_test workqueue_ex_test workqueue_mon_test ## run most tests
 
 .PHONY: tag
 tag: ## create a tag in git. to run, do a 'make VERSION="version string" tag

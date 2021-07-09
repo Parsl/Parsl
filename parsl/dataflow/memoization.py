@@ -1,6 +1,5 @@
 import hashlib
 from functools import lru_cache, singledispatch
-from inspect import getsource
 import logging
 from parsl.serialize import serialize
 import types
@@ -99,22 +98,12 @@ def id_for_memo_dict(denormalized_dict, output_ref=False):
 # that the .register() call, so that the cache-decorated version is registered.
 @id_for_memo.register(types.FunctionType)
 @lru_cache()
-def id_for_memo_function(function, output_ref=False):
-    """This produces function hash material using the source definition of the
-       function.
-
-       The standard serialize_object based approach cannot be used as it is
-       too sensitive to irrelevant facts such as the source line, meaning
-       a whitespace line added at the top of a source file will cause the hash
-       to change.
+def id_for_memo_func(f, output_ref=False):
+    """This will extract some, but deliberately not all, details from the function.
+    The intention is to allow the function to be modified in source file without
+    causing memoization invalidation.
     """
-    logger.debug("serialising id_for_memo_function for function {}, type {}".format(function, type(function)))
-    try:
-        fn_source = getsource(function)
-    except Exception as e:
-        logger.warning("Unable to get source code for app caching. Recommend creating module. Exception was: {}".format(e))
-        fn_source = function.__name__
-    return serialize(fn_source.encode('utf-8'))
+    return serialize(["types.FunctionType", f.__name__, f.__module__])
 
 
 class Memoizer(object):
@@ -196,7 +185,7 @@ class Memoizer(object):
         if 'outputs' in task['kwargs']:
             outputs = task['kwargs']['outputs']
             del filtered_kw['outputs']
-            t = t + [id_for_memo(outputs, output_ref=True)]   # TODO: use append?
+            t = t + [b'outputs', id_for_memo(outputs, output_ref=True)]   # TODO: use append?
 
         t = t + [id_for_memo(filtered_kw)]
         t = t + [id_for_memo(task['func']),
@@ -275,9 +264,14 @@ class Memoizer(object):
         if not self.memoize or not task['memoize'] or 'hashsum' not in task:
             return
 
+        if 'hashsum' not in task:
+            logger.error("Attempt to update memo for task {} with no hashsum".format(task_id))
+            return
+
         if task['hashsum'] in self.memo_lookup_table:
             logger.info('Updating app cache entry with latest %s:%s call' %
                         (task['func_name'], task_id))
             self.memo_lookup_table[task['hashsum']] = r
         else:
+            logger.debug("Storing original memo for task {}".format(task_id))
             self.memo_lookup_table[task['hashsum']] = r

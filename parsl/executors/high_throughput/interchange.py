@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import argparse
+import functools
 import zmq
 import os
 import sys
@@ -13,6 +14,7 @@ import queue
 import threading
 import json
 
+from parsl.utils import setproctitle
 from parsl.version import VERSION as PARSL_VERSION
 from parsl.serialize import ParslSerializer
 serialize_object = ParslSerializer().serialize
@@ -86,6 +88,38 @@ class VersionMismatch(Exception):
 
     def __str__(self):
         return self.__repr__()
+
+
+@functools.total_ordering
+class PriorityQueueEntry:
+    """ This class is needed because msg will be a dict, and dicts are not
+    comparable to each other (and if they were, this would be an unnecessary
+    expense because the queue only cares about priority). It provides
+    ordering of the priority ignoring the message content, and implements an
+    ordering that places None behind all other orderings, for use as a default
+    value"""
+    def __init__(self, pri, msg):
+        self.pri = pri
+        self.msg = msg
+
+    def __eq__(self, other):
+        if type(self) != type(other):
+            return NotImplemented
+        return self.pri == other.pri
+
+    def __lt__(self, other):
+        # this is deliberately inverted, so that largest priority number comes out of the queue first
+        if type(self) != type(other):
+            return NotImplemented
+        if self.pri is None:  # special case so that None is always less than every other value
+            return False  # we are more than populated priorities, and equal to None, the inverse of <
+        elif self.pri is not None and other.pri is None:
+            return True
+        else:  # self/other both not None
+            c = self.pri.__gt__(other.pri)
+            if c == NotImplemented:
+                raise RuntimeError("priority values are not comparable: {} vs {}".format(self.pri, other.pri))
+            return c
 
 
 class Interchange(object):
@@ -166,8 +200,14 @@ class Interchange(object):
         self.context = zmq.Context()
         self.task_incoming = self.context.socket(zmq.DEALER)
         self.task_incoming.set_hwm(0)
-        self.task_incoming.RCVTIMEO = 10  # in milliseconds
+
+        # this controls the speed at which the task incoming queue loop runs. The only thing
+        # that loop does aside from task_incoming is check for kill event. The default of
+        # 10ms is pretty high - for this project, I'm fine with this taking a second or so to
+        # detect a kill event.
+        self.task_incoming.RCVTIMEO = 5000  # in milliseconds
         self.task_incoming.connect("tcp://{}:{}".format(client_address, client_ports[0]))
+
         self.results_outgoing = self.context.socket(zmq.DEALER)
         self.results_outgoing.set_hwm(0)
         self.results_outgoing.connect("tcp://{}:{}".format(client_address, client_ports[1]))
@@ -180,7 +220,7 @@ class Interchange(object):
         self.hub_address = hub_address
         self.hub_port = hub_port
 
-        self.pending_task_queue = queue.Queue(maxsize=10 ** 6)
+        self.pending_task_queue = queue.PriorityQueue(maxsize=10 ** 6)
 
         self.worker_ports = worker_ports
         self.worker_port_range = worker_port_range
@@ -238,11 +278,11 @@ class Interchange(object):
         tasks = []
         for i in range(0, count):
             try:
-                x = self.pending_task_queue.get(block=False)
+                qe = self.pending_task_queue.get(block=False)
             except queue.Empty:
                 break
             else:
-                tasks.append(x)
+                tasks.append(qe.msg)
 
         return tasks
 
@@ -266,14 +306,15 @@ class Interchange(object):
                 msg = self.task_incoming.recv_pyobj()
             except zmq.Again:
                 # We just timed out while attempting to receive
-                logger.debug("[TASK_PULL_THREAD] {} tasks in internal queue".format(self.pending_task_queue.qsize()))
+                logger.debug("[TASK_PULL_THREAD] No task received from task_incoming zmq queue. {} tasks already in internal queue".format(
+                    self.pending_task_queue.qsize()))
                 continue
 
             if msg == 'STOP':
                 kill_event.set()
                 break
             else:
-                self.pending_task_queue.put(msg)
+                self.pending_task_queue.put(PriorityQueueEntry(msg['priority'], msg))
                 task_counter += 1
                 logger.debug("[TASK_PULL_THREAD] Fetched task:{}".format(task_counter))
 
@@ -291,9 +332,12 @@ class Interchange(object):
     def _send_monitoring_info(self, hub_channel, manager):
         if hub_channel:
             logger.info("Sending message {} to hub".format(self._ready_manager_queue[manager]))
-            hub_channel.send_pyobj((MessageType.NODE_INFO,
-                                    datetime.datetime.now(),
-                                    self._ready_manager_queue[manager]))
+
+            d = self._ready_manager_queue[manager].copy()
+            d['timestamp'] = datetime.datetime.now()
+            d['last_heartbeat'] = datetime.datetime.fromtimestamp(d['last_heartbeat'])
+
+            hub_channel.send_pyobj((MessageType.NODE_INFO, d))
 
     @wrap_with_logs(target="interchange")
     def _command_server(self, kill_event):
@@ -360,7 +404,8 @@ class Interchange(object):
                 logger.debug("[COMMAND] is alive")
                 continue
 
-    def start(self, poll_period=None):
+    @wrap_with_logs
+    def start(self):
         """ Start the interchange
 
         Parameters:
@@ -372,8 +417,19 @@ class Interchange(object):
 
         hub_channel = self._create_monitoring_channel()
 
-        if poll_period is None:
-            poll_period = self.poll_period
+        # poll period is never specified as a start() parameter, so removing the defaulting here as noise.
+        # poll_period = self.poll_period
+        # however for my hacking:
+        poll_period = 1000
+        # because the executor level poll period also changes the worker pool poll period setting, which I want to experiment with separately.
+        # This setting reduces the speed at which the interchange main loop
+        # iterates. It will iterate once per this tmie, or when two of the
+        # three queues that we need to check are interesting. which means that
+        # third queue (pending_task_queue) will only be dispatched on once
+        # every poll_period. although everythign waiting will be dispatched
+        # then. this will reduce speed of task dispatching some, but give
+        # much less log output. I wonder if it is possible to make this detectable
+        # using poll too (it's a python queue, not a zmq queue which the other poll is for)
 
         start = time.time()
         count = 0
@@ -390,7 +446,6 @@ class Interchange(object):
         self._command_thread.start()
 
         poller = zmq.Poller()
-        # poller.register(self.task_incoming, zmq.POLLIN)
         poller.register(self.task_outgoing, zmq.POLLIN)
         poller.register(self.results_incoming, zmq.POLLIN)
 
@@ -401,7 +456,9 @@ class Interchange(object):
         interesting_managers = set()
 
         while not self._kill_event.is_set():
+            logger.debug("BENC: starting poll")
             self.socks = dict(poller.poll(timeout=poll_period))
+            logger.debug("BENC: ending poll")
 
             # Listen for requests for work
             if self.task_outgoing in self.socks and self.socks[self.task_outgoing] == zmq.POLLIN:
@@ -418,7 +475,7 @@ class Interchange(object):
                     except Exception:
                         logger.warning("[MAIN] Got Exception reading registration message from manager: {}".format(
                             manager), exc_info=True)
-                        logger.debug("[MAIN] Message :\n{}\n".format(message[0]))
+                        logger.debug("[MAIN] Message :\n{}\n".format(message[1]))
                     else:
                         # We set up an entry only if registration works correctly
                         self._ready_manager_queue[manager] = {'last_heartbeat': time.time(),
@@ -446,7 +503,7 @@ class Interchange(object):
                                                 "py.v={} parsl.v={}".format(msg['python_v'].rsplit(".", 1)[0],
                                                                             msg['parsl_v'])
                             )
-                            result_package = {'task_id': -1, 'exception': serialize_object(e)}
+                            result_package = {'type': 'result', 'task_id': -1, 'exception': serialize_object(e)}
                             pkl_package = pickle.dumps(result_package)
                             self.results_outgoing.send(pkl_package)
                             logger.warning("[MAIN] Sent failure reports, unregistering manager")
@@ -491,6 +548,11 @@ class Interchange(object):
                         tasks = self.get_tasks(real_capacity)
                         if tasks:
                             self.task_outgoing.send_multipart([manager, b'', pickle.dumps(tasks)])
+                            # after this point, we've sent a task to the manager, but we haven't
+                            # added it to the 'task' list for that manager, because we don't
+                            # do that for another 5 lines. That should be pretty fast, though?
+                            # but we shouldn't try removing it from the tasks list until we have
+                            # passed that point anyway?
                             task_count = len(tasks)
                             count += task_count
                             tids = [t['task_id'] for t in tasks]
@@ -513,11 +575,30 @@ class Interchange(object):
             # Receive any results and forward to client
             if self.results_incoming in self.socks and self.socks[self.results_incoming] == zmq.POLLIN:
                 logger.debug("[MAIN] entering results_incoming section")
-                manager, *b_messages = self.results_incoming.recv_multipart()
+                manager, *all_messages = self.results_incoming.recv_multipart()
                 if manager not in self._ready_manager_queue:
                     logger.warning("[MAIN] Received a result from a un-registered manager: {}".format(manager))
                 else:
-                    logger.debug("[MAIN] Got {} result items in batch".format(len(b_messages)))
+                    logger.debug("[MAIN] Got {} result items in batch".format(len(all_messages)))
+
+                    b_messages = []
+
+                    # this block needs to split messages into 'result' messages, and process as previously;
+                    # monitoring messages, which should be sent to monitoring via whatever is used?
+                    # and others, which should generate a non-fatal error log
+
+                    # TODO: rework to avoid depickling twice... because that's quite expensive I expect
+
+                    for message in all_messages:
+                        r = pickle.loads(message)
+                        if r['type'] == 'result':
+                            # process this for task ID and forward to executor
+                            b_messages.append(message)
+                        elif r['type'] == 'monitoring':
+                            hub_channel.send_pyobj(r['payload'])
+                        else:
+                            logger.error("Interchange discarding result_queue message of unknown type: {}".format(r['type']))
+
                     for b_message in b_messages:
                         r = pickle.loads(b_message)
                         try:
@@ -529,7 +610,9 @@ class Interchange(object):
                                 manager,
                                 self._ready_manager_queue[manager]['tasks']))
 
-                    self.results_outgoing.send_multipart(b_messages)
+                    if b_messages:
+                        self.results_outgoing.send_multipart(b_messages)
+
                     logger.debug("[MAIN] Current tasks: {}".format(self._ready_manager_queue[manager]['tasks']))
                     if len(self._ready_manager_queue[manager]['tasks']) == 0:
                         self._ready_manager_queue[manager]['idle_since'] = time.time()
@@ -548,7 +631,7 @@ class Interchange(object):
                     try:
                         raise ManagerLost(manager, self._ready_manager_queue[manager]['hostname'])
                     except Exception:
-                        result_package = {'task_id': tid, 'exception': serialize_object(RemoteExceptionWrapper(*sys.exc_info()))}
+                        result_package = {'type': 'result', 'task_id': tid, 'exception': serialize_object(RemoteExceptionWrapper(*sys.exc_info()))}
                         pkl_package = pickle.dumps(result_package)
                         self.results_outgoing.send(pkl_package)
                         logger.warning("[MAIN] Sent failure reports, unregistering manager")
@@ -600,6 +683,7 @@ def starter(comm_q, *args, **kwargs):
 
     The executor is expected to call this function. The args, kwargs match that of the Interchange.__init__
     """
+    setproctitle("parsl: HTEX interchange")
     # logger = multiprocessing.get_logger()
     ic = Interchange(*args, **kwargs)
     comm_q.put((ic.worker_task_port,

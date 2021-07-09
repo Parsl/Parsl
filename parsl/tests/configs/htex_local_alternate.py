@@ -40,6 +40,7 @@ def fresh_config():
         executors=[
             HighThroughputExecutor(
                 label="htex_Local",
+                address="localhost",
                 working_dir=working_dir,
                 storage_access=[FTPInTaskStaging(), HTTPInTaskStaging(), NoOpFileStaging()],
                 worker_debug=True,
@@ -62,7 +63,7 @@ def fresh_config():
         monitoring=MonitoringHub(
                         hub_address="localhost",
                         hub_port=55055,
-                        monitoring_debug=False,
+                        monitoring_debug=True,
                         resource_monitoring_interval=1,
         )
     )

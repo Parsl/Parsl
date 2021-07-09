@@ -22,12 +22,9 @@ from parsl.version import VERSION as PARSL_VERSION
 from parsl.app.errors import RemoteExceptionWrapper
 from parsl.executors.high_throughput.errors import WorkerLost
 from parsl.executors.high_throughput.probe import probe_addresses
-if platform.system() != 'Darwin':
-    from multiprocessing import Queue as mpQueue
-    from multiprocessing import Process as mpProcess
-else:
-    from parsl.executors.high_throughput.mac_safe_queue import MacSafeQueue as mpQueue
-    from parsl.executors.high_throughput.mac_safe_process import MacSafeProcess as mpProcess
+from parsl.multiprocessing import ForkProcess as mpProcess
+
+from parsl.multiprocessing import SizedQueue as mpQueue
 
 from parsl.serialize import unpack_apply_message, serialize
 
@@ -111,8 +108,15 @@ class Manager(object):
         heartbeat_period : int
              Number of seconds after which a heartbeat message is sent to the interchange
 
-        poll_period : int
+        poll_period : int  - either s or ms depending on who is reading it (!)
              Timeout period used by the manager in milliseconds. Default: 10ms
+             This will affect:
+
+               * worker watchdog restart - if a worker fails, we may wait a
+                 poll period before that worker is restarted. 10ms is crazy
+                 low for LSST purposes. A minute would be fine. That loop
+                 doesn't seem to generate log load though in normal use.
+                 But time.sleep is used, which means it defaults to 1000x slower than the other periods. That seems like a bug that should be fixed/clarified
 
         cpu_affinity : str
              Whether each worker should force its affinity to different CPUs
@@ -209,12 +213,14 @@ class Manager(object):
         b_msg = json.dumps(msg).encode('utf-8')
         return b_msg
 
+    # BENC: TODO: this doesn't send valid JSON but the registration receiver code
+    # expects to decode json (for example, the json coming out of create_reg_message)
     def heartbeat(self):
         """ Send heartbeat to the incoming task queue
         """
         heartbeat = (HEARTBEAT_CODE).to_bytes(4, "little")
         r = self.task_incoming.send(heartbeat)
-        logger.debug("Return from heartbeat: {}".format(r))
+        logger.debug("Sent heartbeat, return code {}".format(r))
 
     @wrap_with_logs
     def pull_tasks(self, kill_event):
@@ -238,14 +244,15 @@ class Manager(object):
         last_interchange_contact = time.time()
         task_recv_counter = 0
 
+        # what units is poll_timer? according to this assignment, it should be ms. ZMQ poller also wants poll_timer to be ms.
         poll_timer = self.poll_period
 
         while not kill_event.is_set():
             ready_worker_count = self.ready_worker_queue.qsize()
             pending_task_count = self.pending_task_queue.qsize()
 
-            logger.debug("[TASK_PULL_THREAD] ready workers:{}, pending tasks:{}".format(ready_worker_count,
-                                                                                        pending_task_count))
+            logger.debug("[TASK_PULL_THREAD] ready workers: {}, pending tasks: {}".format(ready_worker_count,
+                                                                                          pending_task_count))
 
             if time.time() > last_beat + self.heartbeat_period:
                 self.heartbeat()
@@ -263,6 +270,7 @@ class Manager(object):
                 _, pkl_msg = self.task_incoming.recv_multipart()
                 tasks = pickle.loads(pkl_msg)
                 last_interchange_contact = time.time()
+                logger.debug("Updating time of last heartbeat from interchange at {}".format(last_interchange_contact))
 
                 if tasks == 'STOP':
                     logger.critical("[TASK_PULL_THREAD] Received stop request")
@@ -309,7 +317,12 @@ class Manager(object):
 
         logger.debug("[RESULT_PUSH_THREAD] Starting thread")
 
-        push_poll_period = max(10, self.poll_period) / 1000    # push_poll_period must be atleast 10 ms
+        # push_poll_period is in s
+
+        push_poll_period = max(10, self.poll_period) / 1000
+        # push_poll_period must be at least 10 ms [BENC: why? and why does
+        # this one have more of a restriction than any of the other timing
+        # parameters? That max statement enforces that. but why enforce it vs other timings?]
         logger.debug("[RESULT_PUSH_THREAD] push poll period: {}".format(push_poll_period))
 
         last_beat = time.time()
@@ -347,6 +360,7 @@ class Manager(object):
         logger.debug("[WORKER_WATCHDOG_THREAD] Starting thread")
 
         while not kill_event.is_set():
+            logger.debug("[WORKER_WATCHDOG_THREAD] Loop")
             for worker_id, p in self.procs.items():
                 if not p.is_alive():
                     logger.info("[WORKER_WATCHDOG_THREAD] Worker {} has died".format(worker_id))
@@ -357,7 +371,7 @@ class Manager(object):
                             raise WorkerLost(worker_id, platform.node())
                         except Exception:
                             logger.info("[WORKER_WATCHDOG_THREAD] Putting exception for task {} in the pending result queue".format(task['task_id']))
-                            result_package = {'task_id': task['task_id'], 'exception': serialize(RemoteExceptionWrapper(*sys.exc_info()))}
+                            result_package = {'type': 'result', 'task_id': task['task_id'], 'exception': serialize(RemoteExceptionWrapper(*sys.exc_info()))}
                             pkl_package = pickle.dumps(result_package)
                             self.pending_result_queue.put(pkl_package)
                     except KeyError:
@@ -374,7 +388,10 @@ class Manager(object):
                                                  ), name="HTEX-Worker-{}".format(worker_id))
                     self.procs[worker_id] = p
                     logger.info("[WORKER_WATCHDOG_THREAD] Worker {} has been restarted".format(worker_id))
-                time.sleep(self.poll_period)
+                else:
+                    logger.info("[WORKER_WATCHDOG_THREAD] Worker {} is alive".format(worker_id))
+                # time.sleep(self.poll_period) # is this seconds (like sleep) or ms (like self.poll_period)
+                time.sleep(30)  # LSST specific timing
 
         logger.critical("[WORKER_WATCHDOG_THREAD] Exiting")
 
@@ -401,7 +418,7 @@ class Manager(object):
             p.start()
             self.procs[worker_id] = p
 
-        logger.debug("Manager synced with workers")
+        logger.debug("Workers started")
 
         self._task_puller_thread = threading.Thread(target=self.pull_tasks,
                                                     args=(self._kill_event,),
@@ -494,6 +511,10 @@ def worker(worker_id, pool_id, pool_size, task_queue, result_queue, worker_queue
     os.environ['PARSL_WORKER_POOL_ID'] = str(pool_id)
     os.environ['PARSL_WORKER_BLOCK_ID'] = str(args.block_id)
 
+    # share the result queue with monitoring code so it too can send results down that channel
+    import parsl.executors.high_throughput.monitoring_info as mi
+    mi.result_queue = result_queue
+
     # Sync worker with master
     logger.info('Worker {} started'.format(worker_id))
     if args.debug:
@@ -538,9 +559,9 @@ def worker(worker_id, pool_id, pool_size, task_queue, result_queue, worker_queue
             serialized_result = serialize(result, buffer_threshold=1e6)
         except Exception as e:
             logger.info('Caught an exception: {}'.format(e))
-            result_package = {'task_id': tid, 'exception': serialize(RemoteExceptionWrapper(*sys.exc_info()))}
+            result_package = {'type': 'result', 'task_id': tid, 'exception': serialize(RemoteExceptionWrapper(*sys.exc_info()))}
         else:
-            result_package = {'task_id': tid, 'result': serialized_result}
+            result_package = {'type': 'result', 'task_id': tid, 'result': serialized_result}
             # logger.debug("Result: {}".format(result))
 
         logger.info("Completed task {}".format(tid))
@@ -548,7 +569,7 @@ def worker(worker_id, pool_id, pool_size, task_queue, result_queue, worker_queue
             pkl_package = pickle.dumps(result_package)
         except Exception:
             logger.exception("Caught exception while trying to pickle the result package")
-            pkl_package = pickle.dumps({'task_id': tid,
+            pkl_package = pickle.dumps({'type': 'result', 'task_id': tid,
                                         'exception': serialize(RemoteExceptionWrapper(*sys.exc_info()))
             })
 

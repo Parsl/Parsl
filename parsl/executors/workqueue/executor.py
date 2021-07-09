@@ -9,6 +9,7 @@ import logging
 from concurrent.futures import Future
 from ctypes import c_bool
 
+import datetime
 import tempfile
 import hashlib
 import subprocess
@@ -25,14 +26,14 @@ import parsl.utils as putils
 from parsl.executors.errors import ExecutorError
 from parsl.data_provider.files import File
 from parsl.errors import OptionalModuleMissing
-from parsl.executors.status_handling import NoStatusHandlingExecutor
+from parsl.executors.status_handling import BlockProviderExecutor
 from parsl.providers.provider_base import ExecutionProvider
 from parsl.providers import LocalProvider, CondorProvider
-from parsl.executors.errors import ScalingFailed
 from parsl.executors.workqueue import exec_parsl_function
+from parsl.utils import setproctitle
 
 import typeguard
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 from parsl.data_provider.staging import Staging
 
 from .errors import WorkQueueTaskFailure
@@ -60,7 +61,8 @@ logger = logging.getLogger(__name__)
 
 
 # Support structure to communicate parsl tasks to the work queue submit thread.
-ParslTaskToWq = namedtuple('ParslTaskToWq', 'id category cores memory disk gpus env_pkg map_file function_file result_file input_files output_files')
+ParslTaskToWq = namedtuple('ParslTaskToWq',
+                           'id category cores memory disk gpus priority running_time_min env_pkg map_file function_file result_file input_files output_files')
 
 # Support structure to communicate final status of work queue tasks to parsl
 # result is only valid if result_received is True
@@ -74,7 +76,7 @@ WqTaskToParsl = namedtuple('WqTaskToParsl', 'id result_received result reason st
 ParslFileToWq = namedtuple('ParslFileToWq', 'parsl_name stage cache')
 
 
-class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
+class WorkQueueExecutor(BlockProviderExecutor, putils.RepresentationMixin):
     """Executor to use Work Queue batch system
 
     The WorkQueueExecutor system utilizes the Work Queue framework to
@@ -196,6 +198,8 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
             'work_queue_worker'.
     """
 
+    radio_mode = "filesystem"
+
     @typeguard.typechecked
     def __init__(self,
                  label: str = "WorkQueueExecutor",
@@ -221,8 +225,7 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
                  worker_options: str = "",
                  full_debug: bool = True,
                  worker_executable: str = 'work_queue_worker'):
-        NoStatusHandlingExecutor.__init__(self)
-        self._provider = provider
+        BlockProviderExecutor.__init__(self, provider)
         self._scaling_enabled = True
 
         if not _work_queue_enabled:
@@ -273,6 +276,11 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
         self.launch_cmd = ("{package_prefix}python3 exec_parsl_function.py {mapping} {function} {result}")
         if self.init_command != "":
             self.launch_cmd = self.init_command + "; " + self.launch_cmd
+
+    def _get_launch_command(self, block_id):
+        # this executor uses different terminology for worker/launch
+        # commands than in htex
+        return f"PARSL_WORKER_BLOCK_ID={block_id} {self.worker_command}"
 
     def start(self):
         """Create submit process and collector thread to create, send, and
@@ -354,11 +362,13 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
         memory = None
         disk = None
         gpus = None
+        priority = None
+        running_time_min = None
         if resource_specification and isinstance(resource_specification, dict):
             logger.debug("Got resource specification: {}".format(resource_specification))
 
             required_resource_types = set(['cores', 'memory', 'disk'])
-            acceptable_resource_types = set(['cores', 'memory', 'disk', 'gpus'])
+            acceptable_resource_types = set(['cores', 'memory', 'disk', 'gpus', 'priority', 'running_time_min'])
             keys = set(resource_specification.keys())
 
             if not keys.issubset(acceptable_resource_types):
@@ -367,7 +377,12 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
                 logger.error(message)
                 raise ExecutorError(self, message)
 
-            if not self.autolabel and not keys.issuperset(required_resource_types):
+            # this checks that either all of the required resource types are specified, or
+            # that none of them are: the `required_resource_types` are not actually required,
+            # but if one is specified, then they all must be.
+            key_check = required_resource_types.intersection(keys)
+            required_keys_ok = len(key_check) == 0 or key_check == required_resource_types
+            if not self.autolabel and not required_keys_ok:
                 logger.error("Running with `autolabel=False`. In this mode, "
                              "task resource specification requires "
                              "three resources to be specified simultaneously: cores, memory, and disk")
@@ -384,6 +399,10 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
                     disk = resource_specification[k]
                 elif k == 'gpus':
                     gpus = resource_specification[k]
+                elif k == 'priority':
+                    priority = resource_specification[k]
+                elif k == 'running_time_min':
+                    running_time_min = resource_specification[k]
 
         self.task_counter += 1
         task_id = self.task_counter
@@ -412,7 +431,9 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
 
         # Create a Future object and have it be mapped from the task ID in the tasks dictionary
         fu = Future()
+        logger.debug("Getting tasks_lock to set WQ-level task entry")
         with self.tasks_lock:
+            logger.debug("Got tasks_lock to set WQ-level task entry")
             self.tasks[str(task_id)] = fu
 
         logger.debug("Creating task {} for function {} with args {}".format(task_id, func, args))
@@ -447,6 +468,8 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
                                                  memory,
                                                  disk,
                                                  gpus,
+                                                 priority,
+                                                 running_time_min,
                                                  env_pkg,
                                                  map_file,
                                                  function_file,
@@ -596,24 +619,21 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
                 logger.debug("Scaling out failed: {}".format(e))
                 raise e
 
-    def scale_out(self, blocks=1):
-        """Scale out method.
-
-        We should have the scale out method simply take resource object
-        which will have the scaling methods, scale_out itself should be a coroutine, since
-        scaling tasks can be slow.
+    @property
+    def outstanding(self) -> int:
+        """Count the number of outstanding tasks. This is inefficiently
+        implemented and probably could be replaced with a counter.
         """
-        if self.provider:
-            for i in range(blocks):
-                external_block = str(len(self.blocks))
-                internal_block = self.provider.submit(self.worker_command, 1)
-                # Failed to create block with provider
-                if not internal_block:
-                    raise(ScalingFailed(self.provider.label, "Attempts to create nodes using the provider has failed"))
-                else:
-                    self.blocks[external_block] = internal_block
-        else:
-            logger.error("No execution provider available to scale")
+        outstanding = 0
+        for fut in self.tasks.values():
+            if not fut.done():
+                outstanding += 1
+        logger.debug(f"Counted {outstanding} outstanding tasks")
+        return outstanding
+
+    @property
+    def workers_per_node(self) -> Union[int, float]:
+        return 1
 
     def scale_in(self, count):
         """Scale in method. Not implemented.
@@ -632,22 +652,47 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
         """Shutdown the executor. Sets flag to cancel the submit process and
         collector thread, which shuts down the Work Queue system submission.
         """
+        logger.debug("Work Queue shutdown started")
         self.should_stop.value = True
 
         # Remove the workers that are still going
         kill_ids = [self.blocks[block] for block in self.blocks.keys()]
         if self.provider:
+            logger.debug("Cancelling blocks")
             self.provider.cancel(kill_ids)
 
+        logger.debug("Joining on submit process")
         self.submit_process.join()
+        logger.debug("Joining on collector thread")
         self.collector_thread.join()
 
+        logger.debug("Work Queue shutdown completed")
         return True
 
     def scaling_enabled(self):
         """Specify if scaling is enabled. Not enabled in Work Queue.
         """
         return self._scaling_enabled
+
+    # TODO: factor this with htex - perhaps it should exist only in the
+    # block provider, and there should be no implementation of this at
+    # all in the base executor class (because this is only block
+    # relevant)
+    def create_monitoring_info(self, status):
+        """ Create a msg for monitoring based on the poll status
+
+        """
+        msg = []
+        for bid, s in status.items():
+            d = {}
+            d['run_id'] = self.run_id
+            d['status'] = s.status_name
+            d['timestamp'] = datetime.datetime.now()
+            d['executor_label'] = self.label
+            d['job_id'] = self.blocks.get(bid, None)
+            d['block_id'] = bid
+            msg.append(d)
+        return msg
 
     def run_dir(self, value=None):
         """Path to the run directory.
@@ -683,7 +728,10 @@ class WorkQueueExecutor(NoStatusHandlingExecutor, putils.RepresentationMixin):
                     # work queue modes, such as resource exhaustion.
                     future.set_exception(WorkQueueTaskFailure(task_report.reason, task_report.result))
         finally:
+            logger.debug("Marking all outstanding tasks as failed")
+            logger.debug("Acquiring tasks_lock")
             with self.tasks_lock:
+                logger.debug("Acquired tasks_lock")
                 # set exception for tasks waiting for results that work queue did not execute
                 for fu in self.tasks.values():
                     if not fu.done():
@@ -719,6 +767,7 @@ def _work_queue_submit_wait(task_queue=multiprocessing.Queue(),
     module capabilities, rather than shared memory.
     """
     logger.debug("Starting WorkQueue Submit/Wait Process")
+    setproctitle("parsl: Work Queue submit/wait")
 
     # Enable debugging flags and create logging file
     wq_debug_log = None
@@ -815,6 +864,16 @@ def _work_queue_submit_wait(task_queue=multiprocessing.Queue(),
                 t.specify_disk(task.disk)
             if task.gpus is not None:
                 t.specify_gpus(task.gpus)
+            if task.priority is not None:
+                t.specify_priority(task.priority)
+            if task.running_time_min is not None:
+                t.specify_running_time_min(task.running_time_min)
+
+            if max_retries is not None:
+                logger.debug(f"Specifying max_retries {max_retries}")
+                t.specify_max_retries(max_retries)
+            else:
+                logger.debug("Not specifying max_retries")
 
             if max_retries is not None:
                 logger.debug(f"Specifying max_retries {max_retries}")
